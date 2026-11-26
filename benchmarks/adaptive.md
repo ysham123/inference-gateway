@@ -30,3 +30,9 @@ python3 benchmarks/sweep.py --backend vllm \
 Use `--trace` with the Azure conversation CSV and different `--trace-offset` values for separate replay windows. The replay uses timestamps and approximate input sizes to generate synthetic prompts, clips prompt size and output caps, and adds a synthetic batch workload. Pick the windows in advance and preserve the backend, profile, settings and source offsets with the results. [Azure 2024 trace and citation information](https://github.com/Azure/AzurePublicDataset/blob/master/AzureLLMInferenceDataset2024.md)
 
 A chat request meets the objective when the stream completes and both its first text and average time per output token are within budget. Rejections, transport errors and missing timing data count as misses. Batch throughput uses reported completion tokens and includes queue drain. `frontier.json` records the highest tested batch rate per policy at each fixed chat load whose repeats each achieve 95% chat attainment. Its rate is the lowest across those repeats. A null entry means the tested grid did not meet that condition. These are finite replays, so report the workload window and completion counts with the result.
+
+## Local pilot
+
+The [M2 Pro pilot](results/adaptive-m2-pro/) includes the calibration profile, request records for two chat arrival rates and a short-batch case, and a chart of joint chat attainment and batch throughput.
+
+For the short-batch case, repeat the sweep with `--backend llama --deadline-ms 4000 --tpot-ms 150 --chat-scales 1 --batch-scales 1 --batch-max-tokens 24 --repeats 1` and the same model and profile.

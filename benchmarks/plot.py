@@ -27,17 +27,16 @@ def main():
     if args.joint != (tpot is not None):
         parser.error("--joint is required for reports with both deadlines and omitted for first-token-only reports")
 
-    labels = [
-        "FIFO" if report["label"] == "fifo" else report["label"].capitalize()
-        for report in reports
-    ]
+    policies = [report["label"].split("-", 1)[0] for report in reports]
+    labels = ["FIFO" if policy == "fifo" else policy.capitalize() for policy in policies]
     color_by_policy = {
         "direct": "#667085",
         "fifo": "#405CB3",
         "weighted": "#7661BA",
         "reserved": "#137D74",
+        "adaptive": "#A94B12",
     }
-    colors = [color_by_policy.get(report["label"], "#667085") for report in reports]
+    colors = [color_by_policy.get(policy, "#667085") for policy in policies]
     hit_rates = [100 * report["summary"]["interactive"]["deadline_hit_fraction"] for report in reports]
     if args.joint:
         batch_rates = [report["summary"]["batch"]["completed_tokens_per_second"] for report in reports]
@@ -62,6 +61,8 @@ def main():
         ax.spines[["top", "right", "left"]].set_visible(False)
         ax.spines["bottom"].set_color("#D0D5DD")
         ax.grid(axis="y", color="#E4E7EC", linewidth=0.8)
+    if args.joint:
+        axes[0].axhline(95, color="#424857", linestyle="--", linewidth=0.8, zorder=4)
     fig.suptitle(
         f"Inference gateway | {scenario.capitalize()} workload",
         x=0.02, ha="left", fontsize=15, fontweight="bold",
