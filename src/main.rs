@@ -1,5 +1,8 @@
 mod scheduler;
 
+#[cfg(test)]
+mod gateway_tests;
+
 use std::{
     env,
     error::Error,
@@ -52,19 +55,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .read_timeout(Duration::from_secs(120))
         .build()?;
 
-    let app = Router::new()
-        .route("/health", get(|| async { StatusCode::NO_CONTENT }))
-        .route("/v1/chat/completions", post(chat_completions))
-        .with_state(Gateway {
-            client,
-            completions_url,
-            scheduler: Arc::new(Scheduler::new(max_active, max_waiting, policy)),
-        });
+    let app = router(Gateway {
+        client,
+        completions_url,
+        scheduler: Arc::new(Scheduler::new(max_active, max_waiting, policy)),
+    });
 
     let listener = TcpListener::bind(address).await?;
     println!("Gateway listening on http://{}", listener.local_addr()?);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+fn router(gateway: Gateway) -> Router {
+    Router::new()
+        .route("/health", get(|| async { StatusCode::NO_CONTENT }))
+        .route("/v1/chat/completions", post(chat_completions))
+        .with_state(gateway)
 }
 
 async fn chat_completions(
