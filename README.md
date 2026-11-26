@@ -1,6 +1,6 @@
 # Inference Gateway
 
-A local Rust gateway for streaming chat completions with FIFO and weighted scheduling.
+A local Rust gateway for streaming chat completions with FIFO, weighted, and reserved-slot scheduling.
 
 ## Run locally
 
@@ -31,6 +31,8 @@ Set `MAX_ACTIVE_REQUESTS` to a positive value that fits the backend's parallel c
 ## Scheduling
 
 `SCHEDULING_POLICY=fifo` serves waiting requests in arrival order and is the default. `SCHEDULING_POLICY=weighted` dispatches three interactive requests for every batch request when both classes have work waiting. Each class keeps its own arrival order, and either class can use spare capacity when the other is empty.
+
+`SCHEDULING_POLICY=reserved` uses the weighted policy and leaves one active slot available only to interactive requests. It requires at least two active slots. The reserved slot remains idle if chat traffic is absent and all other slots are occupied by batch work.
 
 Send `X-Request-Class: batch` for batch work. Requests without the header are interactive. The `X-Queue-Wait-Ms` response header measures time spent waiting for gateway admission.
 

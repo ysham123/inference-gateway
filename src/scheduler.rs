@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     num::NonZeroUsize,
     str::FromStr,
     sync::{Arc, Mutex},
@@ -17,6 +17,7 @@ pub enum RequestClass {
 pub enum SchedulingPolicy {
     Fifo,
     Weighted,
+    Reserved,
 }
 
 impl FromStr for SchedulingPolicy {
@@ -26,7 +27,8 @@ impl FromStr for SchedulingPolicy {
         match value {
             "fifo" => Ok(Self::Fifo),
             "weighted" => Ok(Self::Weighted),
-            _ => Err("SCHEDULING_POLICY must be fifo or weighted"),
+            "reserved" => Ok(Self::Reserved),
+            _ => Err("SCHEDULING_POLICY must be fifo, weighted, or reserved"),
         }
     }
 }
@@ -41,7 +43,7 @@ pub struct Scheduler {
 #[derive(Default)]
 struct State {
     next_id: u64,
-    active: HashSet<u64>,
+    active: HashMap<u64, RequestClass>,
     waiting: VecDeque<Waiter>,
     interactive_turns: usize,
 }
@@ -73,14 +75,14 @@ impl Scheduler {
     pub async fn acquire(self: &Arc<Self>, class: RequestClass) -> Result<Admission, QueueFull> {
         let (id, ready) = {
             let mut state = self.state.lock().unwrap();
-            let at_capacity = state.active.len() >= self.max_active.get();
-            if at_capacity && state.waiting.len() >= self.max_waiting {
+            let can_start = state.can_start(class, self.policy, self.max_active);
+            if !can_start && state.waiting.len() >= self.max_waiting {
                 return Err(QueueFull);
             }
 
             let id = state.next_id;
             state.next_id += 1;
-            if at_capacity {
+            if !can_start {
                 let (sender, receiver) = oneshot::channel();
                 state.waiting.push_back(Waiter {
                     id,
@@ -89,7 +91,7 @@ impl Scheduler {
                 });
                 (id, Some(receiver))
             } else {
-                state.active.insert(id);
+                state.active.insert(id, class);
                 (id, None)
             }
         };
@@ -106,19 +108,20 @@ impl Scheduler {
 
     fn release(&self, id: u64) {
         let mut state = self.state.lock().unwrap();
-        if !state.active.remove(&id) {
+        if state.active.remove(&id).is_none() {
             state.waiting.retain(|waiter| waiter.id != id);
             return;
         }
 
         while state.active.len() < self.max_active.get() {
-            let Some((index, interactive_turns)) = state.next_waiter(self.policy) else {
+            let Some((index, interactive_turns)) = state.next_waiter(self.policy, self.max_active)
+            else {
                 state.interactive_turns = 0;
                 break;
             };
             let waiter = state.waiting.remove(index).unwrap();
             if waiter.ready.send(()).is_ok() {
-                state.active.insert(waiter.id);
+                state.active.insert(waiter.id, waiter.class);
                 state.interactive_turns = interactive_turns;
             }
         }
@@ -126,14 +129,42 @@ impl Scheduler {
 }
 
 impl State {
-    fn next_waiter(&self, policy: SchedulingPolicy) -> Option<(usize, usize)> {
+    fn can_start(
+        &self,
+        class: RequestClass,
+        policy: SchedulingPolicy,
+        max_active: NonZeroUsize,
+    ) -> bool {
+        if self.active.len() >= max_active.get() {
+            return false;
+        }
+        if matches!(policy, SchedulingPolicy::Reserved) && class == RequestClass::Batch {
+            let active_batch = self
+                .active
+                .values()
+                .filter(|&&class| class == RequestClass::Batch)
+                .count();
+            return active_batch < max_active.get() - 1;
+        }
+        true
+    }
+
+    fn next_waiter(
+        &self,
+        policy: SchedulingPolicy,
+        max_active: NonZeroUsize,
+    ) -> Option<(usize, usize)> {
         if matches!(policy, SchedulingPolicy::Fifo) {
             return self.waiting.front().map(|_| (0, 0));
         }
 
         let first_of_class = |class| self.waiting.iter().position(|waiter| waiter.class == class);
         let interactive = first_of_class(RequestClass::Interactive);
-        let batch = first_of_class(RequestClass::Batch);
+        let batch = if self.can_start(RequestClass::Batch, policy, max_active) {
+            first_of_class(RequestClass::Batch)
+        } else {
+            None
+        };
         match (interactive, batch) {
             (Some(index), Some(_)) if self.interactive_turns < 3 => {
                 Some((index, self.interactive_turns + 1))
@@ -235,5 +266,28 @@ mod tests {
         assert!(poll!(&mut interactive[3]).is_pending());
         assert!(matches!(poll!(&mut batch), Poll::Ready(Ok(_))));
         assert!(matches!(poll!(&mut interactive[3]), Poll::Ready(Ok(_))));
+    }
+
+    #[tokio::test]
+    async fn reserved_capacity_accepts_chat_even_when_the_batch_queue_is_full() {
+        let scheduler = Arc::new(Scheduler::new(
+            NonZeroUsize::new(2).unwrap(),
+            1,
+            SchedulingPolicy::Reserved,
+        ));
+        let first_batch = scheduler.acquire(RequestClass::Batch).await.unwrap();
+        let mut second_batch = Box::pin(scheduler.acquire(RequestClass::Batch));
+        assert!(poll!(&mut second_batch).is_pending());
+        assert!(scheduler.acquire(RequestClass::Batch).await.is_err());
+
+        let mut chat = Box::pin(scheduler.acquire(RequestClass::Interactive));
+        let Poll::Ready(Ok(chat)) = poll!(&mut chat) else {
+            panic!("chat should use the reserved slot");
+        };
+        drop(chat);
+        assert!(poll!(&mut second_batch).is_pending());
+
+        drop(first_batch);
+        assert!(matches!(poll!(&mut second_batch), Poll::Ready(Ok(_))));
     }
 }

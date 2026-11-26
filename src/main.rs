@@ -47,6 +47,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let policy: SchedulingPolicy = env::var("SCHEDULING_POLICY")
         .unwrap_or_else(|_| "fifo".into())
         .parse()?;
+    if matches!(policy, SchedulingPolicy::Reserved) && max_active.get() < 2 {
+        return Err("SCHEDULING_POLICY=reserved requires MAX_ACTIVE_REQUESTS of at least 2".into());
+    }
     let completions_url = Url::parse(&upstream)?.join("/v1/chat/completions")?;
     let client = Client::builder()
         .no_proxy()
