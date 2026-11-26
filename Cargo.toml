@@ -1,0 +1,9 @@
+[package]
+name = "inference-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["stream"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
