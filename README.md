@@ -50,3 +50,7 @@ python3 benchmarks/replay.py --label fifo --scenario burst --deadline-ms 750 --o
 Choose a first-token target from the solo run before comparing policies. Use the same target and scenario for each comparison. Run against the backend directly by setting `--url http://127.0.0.1:8081/v1/chat/completions`.
 
 The JSON report has one row per offered request. The time-to-first-token p95 describes successful streams, and the deadline hit fraction includes failures and rejected requests in the denominator. Batch throughput counts completed requests across the full replay window, including time to drain the queue.
+
+## Adaptive admission
+
+The adaptive policy lets batch work borrow the last idle slot when the calibrated time to first token and the estimated wait for a slot fit the chat budget. A pending chat request, an unprofiled request, or an overdue estimate keeps the slot in reserve. The estimate is scoped to the model and engine used for calibration. The [evaluation guide](benchmarks/adaptive.md) shows how to calibrate it and compare it with native vLLM priority.

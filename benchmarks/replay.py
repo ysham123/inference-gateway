@@ -19,7 +19,16 @@ class Request:
     max_tokens: int
 
 
-def workload(scenario):
+def workload(scenario, profile_words=(32, 128), profile_caps=(12, 24, 96)):
+    if scenario == "calibration":
+        return [
+            Request(0, "interactive" if tokens == 12 else "batch",
+                    ("Summarize this passage." + " word" * words), tokens)
+            for words in profile_words
+            for tokens in profile_caps
+            for _ in range(3)
+        ]
+
     def chat(arrival, index):
         return Request(arrival, "interactive", f"Question {index}: Why is the sky blue?", 12)
 
@@ -97,6 +106,7 @@ def send(endpoint, model, request, start, timeout_s, backend, native_priority):
         "prompt_tokens": None,
         "total_ms": None,
         "queue_wait_ms": None,
+        "borrowed": False,
         "status": None,
         "outcome": "incomplete",
     }
@@ -110,6 +120,7 @@ def send(endpoint, model, request, start, timeout_s, backend, native_priority):
         )
         response = connection.getresponse()
         result["status"] = response.status
+        result["borrowed"] = response.getheader("X-Admission-Borrowed") == "1"
         queue_wait = response.getheader("X-Queue-Wait-Ms")
         if queue_wait is not None:
             result["queue_wait_ms"] = float(queue_wait)
@@ -176,6 +187,7 @@ def summarize(results, deadline_ms, tpot_ms=None):
         batch_tokens = sum(result["completion_tokens"] or 0 for result in completed)
         classes[request_class] = {
             "offered": len(offered),
+            "borrowed_dispatches": sum(result["borrowed"] for result in offered),
             "completed": len(completed),
             "overload_503": sum(result["status"] == 503 for result in offered),
             "ttft_p95_ms": percentile(starts, 0.95),
@@ -198,7 +210,7 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--model", default="local-model")
     parser.add_argument("--label", required=True)
-    parser.add_argument("--scenario", choices=("solo", "steady", "burst", "overload", "batch-only"), required=True)
+    parser.add_argument("--scenario", choices=("solo", "steady", "burst", "overload", "batch-only", "calibration"), required=True)
     parser.add_argument("--deadline-ms", type=float)
     parser.add_argument("--tpot-ms", type=float)
     parser.add_argument("--chat-scale", type=float, default=1)
@@ -208,7 +220,10 @@ def main():
     parser.add_argument("--trace", type=Path)
     parser.add_argument("--trace-limit", type=int, default=24)
     parser.add_argument("--trace-offset", type=int, default=0)
+    parser.add_argument("--profile-words", nargs="+", type=int, default=[32, 128])
+    parser.add_argument("--profile-caps", nargs="+", type=int, default=[12, 24, 96])
     parser.add_argument("--timeout-s", type=float, default=90)
+    parser.add_argument("--allow-all-rejected", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     endpoint = urlsplit(args.url)
@@ -227,19 +242,28 @@ def main():
         if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"{name} must be positive and finite")
 
-    base = trace_workload(args.trace, args.trace_limit, args.trace_offset) if args.trace else workload(args.scenario)
+    if min(args.profile_words + args.profile_caps) < 1 or 12 not in args.profile_caps:
+        parser.error("profile buckets must be positive and include the 12-token chat case")
+    if args.trace and args.scenario == "calibration":
+        parser.error("calibration uses synthetic size buckets")
+    base = (
+        trace_workload(args.trace, args.trace_limit, args.trace_offset)
+        if args.trace else workload(args.scenario, args.profile_words, args.profile_caps)
+    )
     scales = {"interactive": args.chat_scale, "batch": args.batch_scale}
     requests = sorted(
         (replace(request, arrival_s=request.arrival_s * scales[request.request_class]) for request in base),
         key=lambda request: request.arrival_s,
     )
-    with ThreadPoolExecutor(max_workers=len(requests)) as executor:
+    if args.scenario == "calibration":
         start = time.monotonic()
-        futures = []
-        for request in requests:
-            time.sleep(max(0, start + request.arrival_s - time.monotonic()))
-            futures.append(executor.submit(send, endpoint, args.model, request, start, args.timeout_s, args.backend, args.native_priority))
-        results = [future.result() for future in futures]
+        results = [
+            send(endpoint, args.model, replace(request, arrival_s=time.monotonic() - start),
+                 start, args.timeout_s, args.backend, args.native_priority)
+            for request in requests
+        ]
+    else:
+        results = replay(endpoint, args, requests)
 
     summary = summarize(results, args.deadline_ms, args.tpot_ms)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -260,9 +284,20 @@ def main():
         "requests": results,
     }, indent=2) + "\n")
     print(json.dumps(summary, indent=2))
-    if not any(result["outcome"] == "completed" for result in results):
+    if not any(result["outcome"] == "completed" for result in results) and not (
+        args.allow_all_rejected and all(result["status"] in (429, 503) for result in results)
+    ):
         raise SystemExit("No requests completed. Check the model server, URL, and model name.")
 
+
+def replay(endpoint, args, requests):
+    with ThreadPoolExecutor(max_workers=len(requests)) as executor:
+        start = time.monotonic()
+        futures = []
+        for request in requests:
+            time.sleep(max(0, start + request.arrival_s - time.monotonic()))
+            futures.append(executor.submit(send, endpoint, args.model, request, start, args.timeout_s, args.backend, args.native_priority))
+        return [future.result() for future in futures]
 
 if __name__ == "__main__":
     main()

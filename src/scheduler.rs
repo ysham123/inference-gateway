@@ -67,7 +67,7 @@ impl Active {
 struct Waiter {
     id: u64,
     class: RequestClass,
-    ready: oneshot::Sender<()>,
+    ready: oneshot::Sender<bool>,
     estimate: Option<Duration>,
 }
 
@@ -77,6 +77,7 @@ pub struct QueueFull;
 pub struct Admission {
     scheduler: Arc<Scheduler>,
     id: u64,
+    pub borrowed: bool,
 }
 
 impl Scheduler {
@@ -94,7 +95,7 @@ impl Scheduler {
         class: RequestClass,
         estimate: Option<Duration>,
     ) -> Result<Admission, QueueFull> {
-        let (id, ready) = {
+        let (id, ready, borrowed) = {
             let mut state = self.state.lock().unwrap();
             if class == RequestClass::Batch
                 && matches!(self.policy, SchedulingPolicy::Adaptive { .. })
@@ -120,19 +121,21 @@ impl Scheduler {
                     ready: sender,
                     estimate,
                 });
-                (id, Some(receiver))
+                (id, Some(receiver), false)
             } else {
+                let borrowed = self.borrowing(&state, class);
                 state.active.insert(id, Active::new(class, estimate));
-                (id, None)
+                (id, None, borrowed)
             }
         };
 
-        let admission = Admission {
+        let mut admission = Admission {
             scheduler: Arc::clone(self),
             id,
+            borrowed,
         };
         if let Some(ready) = ready {
-            ready.await.expect("a queued request retains its scheduler");
+            admission.borrowed = ready.await.expect("a queued request retains its scheduler");
         }
         Ok(admission)
     }
@@ -145,6 +148,12 @@ impl Scheduler {
         self.dispatch(&mut state);
     }
 
+    fn borrowing(&self, state: &State, class: RequestClass) -> bool {
+        matches!(self.policy, SchedulingPolicy::Adaptive { .. })
+            && class == RequestClass::Batch
+            && state.active.len() == self.max_active.get() - 1
+    }
+
     fn dispatch(&self, state: &mut State) {
         while state.active.len() < self.max_active.get() {
             let Some((index, interactive_turns)) = state.next_waiter(self.policy, self.max_active)
@@ -153,7 +162,11 @@ impl Scheduler {
                 break;
             };
             let waiter = state.waiting.remove(index).unwrap();
-            if waiter.ready.send(()).is_ok() {
+            if waiter
+                .ready
+                .send(self.borrowing(state, waiter.class))
+                .is_ok()
+            {
                 state
                     .active
                     .insert(waiter.id, Active::new(waiter.class, waiter.estimate));

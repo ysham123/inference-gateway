@@ -137,6 +137,7 @@ async fn chat_completions(
         }
     };
 
+    let borrowed = admission.borrowed;
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let stream = stream::unfold(
@@ -148,6 +149,11 @@ async fn chat_completions(
     );
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
+    if borrowed {
+        response
+            .headers_mut()
+            .insert("x-admission-borrowed", HeaderValue::from_static("1"));
+    }
     let queue_wait_ms = format!("{:.3}", queue_wait.as_secs_f64() * 1_000.0);
     response.headers_mut().insert(
         "x-queue-wait-ms",
