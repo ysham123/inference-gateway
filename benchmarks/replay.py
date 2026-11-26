@@ -1,6 +1,8 @@
 import argparse
+import csv
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 import http.client
 import json
 import math
@@ -48,22 +50,52 @@ def workload(scenario):
     return sorted(requests, key=lambda request: request.arrival_s)
 
 
-def send(endpoint, model, request, start, timeout_s):
+def trace_workload(path, limit, offset):
+    with path.open(newline="") as file:
+        rows = sorted(
+            (datetime.fromisoformat(row["TIMESTAMP"].replace("Z", "+00:00")),
+             int(row["ContextTokens"]), int(row["GeneratedTokens"]))
+            for row in csv.DictReader(file)
+        )
+    rows = [(when, prompt, output) for when, prompt, output in rows if output > 1]
+    rows = rows[offset:offset + limit]
+    if not rows:
+        raise ValueError("trace has no usable requests")
+    start = rows[0][0]
+    chat = [
+        Request((when - start).total_seconds(), "interactive",
+                f"Request {i}:" + " word" * min(512, prompt), min(128, output))
+        for i, (when, prompt, output) in enumerate(rows)
+    ]
+    background = [request for request in workload("steady") if request.request_class == "batch"]
+    return sorted(chat + background, key=lambda request: request.arrival_s)
+
+
+def send(endpoint, model, request, start, timeout_s, backend, native_priority):
     connection = http.client.HTTPConnection(endpoint.hostname, endpoint.port, timeout=timeout_s)
-    payload = json.dumps({
+    payload = {
         "model": model,
         "messages": [{"role": "user", "content": request.prompt}],
         "stream": True,
         "temperature": 0,
         "max_tokens": request.max_tokens,
         "ignore_eos": True,
-        "cache_prompt": False,
-    })
+        "stream_options": {"include_usage": True},
+    }
+    if backend == "llama":
+        payload["cache_prompt"] = False
+    if native_priority:
+        payload["priority"] = 0 if request.request_class == "interactive" else 10
+    payload = json.dumps(payload)
     sent = time.monotonic()
     result = {
         **asdict(request),
         "launch_delay_ms": (sent - start - request.arrival_s) * 1_000,
         "ttft_ms": None,
+        "tpot_ms": None,
+        "completion_tokens": None,
+        "prompt_tokens": None,
+        "total_ms": None,
         "queue_wait_ms": None,
         "status": None,
         "outcome": "incomplete",
@@ -85,6 +117,7 @@ def send(endpoint, model, request, start, timeout_s):
             result["outcome"] = "http_error"
             return result
 
+        first_text = last_text = None
         for line in response:
             now = time.monotonic()
             if not line.startswith(b"data:"):
@@ -94,16 +127,29 @@ def send(endpoint, model, request, start, timeout_s):
                 if result["ttft_ms"] is not None:
                     result["outcome"] = "completed"
                 break
-            choices = json.loads(event).get("choices", [])
-            if choices and choices[0].get("delta", {}).get("content") and result["ttft_ms"] is None:
-                result["ttft_ms"] = (now - sent) * 1_000
+            data = json.loads(event)
+            usage = data.get("usage")
+            if usage:
+                result["completion_tokens"] = usage.get("completion_tokens")
+                result["prompt_tokens"] = usage.get("prompt_tokens")
+            choices = data.get("choices", [])
+            if choices and choices[0].get("delta", {}).get("content"):
+                if first_text is None:
+                    first_text = now
+                    result["ttft_ms"] = (now - sent) * 1_000
+                last_text = now
+        tokens = result["completion_tokens"]
+        if first_text is not None and tokens is not None and tokens > 1:
+            result["tpot_ms"] = (last_text - first_text) * 1_000 / (tokens - 1)
         return result
     except (OSError, ValueError, http.client.HTTPException) as error:
         result["outcome"] = "error"
         result["error"] = type(error).__name__
         return result
     finally:
-        result["finished_s"] = time.monotonic() - start
+        finished = time.monotonic()
+        result["finished_s"] = finished - start
+        result["total_ms"] = (finished - sent) * 1_000
         connection.close()
 
 
@@ -111,7 +157,7 @@ def percentile(values, fraction):
     return sorted(values)[math.ceil(len(values) * fraction) - 1] if values else None
 
 
-def summarize(results, deadline_ms):
+def summarize(results, deadline_ms, tpot_ms=None):
     elapsed_s = max(result["finished_s"] for result in results)
     classes = {}
     for request_class in ("interactive", "batch"):
@@ -119,12 +165,23 @@ def summarize(results, deadline_ms):
         completed = [result for result in offered if result["outcome"] == "completed"]
         starts = [result["ttft_ms"] for result in completed]
         queues = [result["queue_wait_ms"] for result in completed if result["queue_wait_ms"] is not None]
-        hits = sum(ms <= deadline_ms for ms in starts) if deadline_ms is not None else None
+        speeds = [result["tpot_ms"] for result in completed if result["tpot_ms"] is not None]
+        hits = None
+        if deadline_ms is not None:
+            hits = sum(
+                result["ttft_ms"] <= deadline_ms
+                and (tpot_ms is None or (result["tpot_ms"] is not None and result["tpot_ms"] <= tpot_ms))
+                for result in completed
+            )
+        batch_tokens = sum(result["completion_tokens"] or 0 for result in completed)
         classes[request_class] = {
             "offered": len(offered),
             "completed": len(completed),
             "overload_503": sum(result["status"] == 503 for result in offered),
             "ttft_p95_ms": percentile(starts, 0.95),
+            "tpot_p95_ms": percentile(speeds, 0.95),
+            "completion_token_coverage": sum(result["completion_tokens"] is not None for result in completed),
+            "completed_tokens_per_second": batch_tokens / elapsed_s,
             "queue_wait_p95_ms": percentile(queues, 0.95),
             "deadline_hit_fraction": hits / len(offered) if hits is not None and offered else None,
             "completed_per_second": len(completed) / elapsed_s,
@@ -143,32 +200,62 @@ def main():
     parser.add_argument("--label", required=True)
     parser.add_argument("--scenario", choices=("solo", "steady", "burst", "overload", "batch-only"), required=True)
     parser.add_argument("--deadline-ms", type=float)
+    parser.add_argument("--tpot-ms", type=float)
+    parser.add_argument("--chat-scale", type=float, default=1)
+    parser.add_argument("--batch-scale", type=float, default=1)
+    parser.add_argument("--backend", choices=("llama", "vllm"), default="llama")
+    parser.add_argument("--native-priority", action="store_true")
+    parser.add_argument("--trace", type=Path)
+    parser.add_argument("--trace-limit", type=int, default=24)
+    parser.add_argument("--trace-offset", type=int, default=0)
     parser.add_argument("--timeout-s", type=float, default=90)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     endpoint = urlsplit(args.url)
     if endpoint.scheme != "http" or not endpoint.hostname or not endpoint.path:
         parser.error("--url must be an HTTP URL with a hostname and completions path")
-    for name, value in (("--deadline-ms", args.deadline_ms), ("--timeout-s", args.timeout_s)):
+    if args.tpot_ms is not None and args.deadline_ms is None:
+        parser.error("--tpot-ms requires --deadline-ms")
+    if args.native_priority and args.backend != "vllm":
+        parser.error("--native-priority requires --backend vllm")
+    if args.trace_limit < 1 or args.trace_offset < 0:
+        parser.error("trace limit must be positive and offset nonnegative")
+    for name, value in (
+        ("--deadline-ms", args.deadline_ms), ("--timeout-s", args.timeout_s),
+        ("--tpot-ms", args.tpot_ms), ("--chat-scale", args.chat_scale), ("--batch-scale", args.batch_scale),
+    ):
         if value is not None and (not math.isfinite(value) or value <= 0):
             parser.error(f"{name} must be positive and finite")
 
-    requests = workload(args.scenario)
+    base = trace_workload(args.trace, args.trace_limit, args.trace_offset) if args.trace else workload(args.scenario)
+    scales = {"interactive": args.chat_scale, "batch": args.batch_scale}
+    requests = sorted(
+        (replace(request, arrival_s=request.arrival_s * scales[request.request_class]) for request in base),
+        key=lambda request: request.arrival_s,
+    )
     with ThreadPoolExecutor(max_workers=len(requests)) as executor:
         start = time.monotonic()
         futures = []
         for request in requests:
             time.sleep(max(0, start + request.arrival_s - time.monotonic()))
-            futures.append(executor.submit(send, endpoint, args.model, request, start, args.timeout_s))
+            futures.append(executor.submit(send, endpoint, args.model, request, start, args.timeout_s, args.backend, args.native_priority))
         results = [future.result() for future in futures]
 
-    summary = summarize(results, args.deadline_ms)
+    summary = summarize(results, args.deadline_ms, args.tpot_ms)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps({
         "label": args.label,
         "scenario": args.scenario,
         "model": args.model,
         "deadline_ms": args.deadline_ms,
+        "tpot_ms": args.tpot_ms,
+        "chat_scale": args.chat_scale,
+        "batch_scale": args.batch_scale,
+        "backend": args.backend,
+        "native_priority": args.native_priority,
+        "trace": args.trace.name if args.trace else None,
+        "trace_offset": args.trace_offset if args.trace else None,
+        "trace_limit": args.trace_limit if args.trace else None,
         "summary": summary,
         "requests": results,
     }, indent=2) + "\n")
