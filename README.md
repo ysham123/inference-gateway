@@ -1,56 +1,82 @@
 # Inference Gateway
 
-A local Rust gateway for streaming chat completions with FIFO, weighted, and reserved-slot scheduling.
+A Rust gateway for serving interactive chat and batch jobs on the same local LLM. It streams OpenAI-style chat completions, limits the waiting queue, and uses measured request times to decide when batch work can use the last idle model slot.
 
-In the first local burst replay, weighted scheduling cut successful chat p95 time to first token from 28.2 s to 13.2 s relative to FIFO. Only 2 of 24 chat requests met the 1.4 s target under weighted scheduling. A reserved slot reduced p95 further and completed more chat requests, while reducing batch throughput. See the [benchmark setup and raw results](benchmarks/README.md).
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Evaluation guide](benchmarks/adaptive.md) · [Raw results and chart](benchmarks/results/adaptive-m2-pro/)
 
-## Run locally
+## Benchmark
 
-Start `llama-server` with a local GGUF model in one terminal:
+In three paired short-batch runs on an **Apple M2 Pro** with **Llama 3.2 3B Instruct** and llama.cpp, adaptive admission met both chat latency targets for **24 of 24 requests in each run**. The targets were 4 seconds to first text and 150 ms per output token.
 
-```sh
-llama-server --model /path/to/model.gguf --alias local-model --host 127.0.0.1 --port 8081
+| Policy | Chat requests meeting both targets | Batch output tokens/s |
+| --- | --- | ---: |
+| Fixed reservation | 21/24, 11/24, 15/24 | 6.79–7.38 |
+| Adaptive admission | 24/24, 24/24, 24/24 | 6.42–7.54 |
+
+Adaptive batch throughput was lower in two runs. At the tighter 1.4-second first-token budget, adaptive admission borrowed zero slots. These results use synthetic traffic on one CPU backend. The [evaluation guide](benchmarks/adaptive.md) also includes the setup for a native vLLM comparison on CUDA.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A["Chat and batch clients"] --> B["Rust gateway"]
+    B --> C["Bounded queue and admission"]
+    D["Calibrated service times"] --> C
+    C --> E["Model server"]
+    E -->|"Token stream"| B
+    B -->|"Token stream"| A
 ```
 
-In a second terminal, run `cargo run` from this project folder. Send a streaming request in a third terminal:
+A request holds its slot while the model streams. If the client disconnects, the gateway drops the upstream response and releases the slot. A full queue returns HTTP 503. The response header `X-Queue-Wait-Ms` records wait time before admission. Adaptive dispatches that borrowed capacity carry `X-Admission-Borrowed: 1`.
+
+| Policy | Admission rule |
+| --- | --- |
+| `fifo` | Dispatch waiting requests in arrival order. |
+| `weighted` | Give chat up to three turns before a batch turn when both classes can run. |
+| `reserved` | Keep one of the active slots for chat. |
+| `adaptive` | Allow batch to use the last idle slot when a profiled completion estimate leaves enough time for chat to start within budget. A waiting chat request or a missing or overdue estimate preserves the slot. |
+
+## Quick start
+
+You’ll need Rust and Cargo, `llama-server`, and a local GGUF model. Start the model server in one terminal.
+
+```sh
+llama-server --model /path/to/model.gguf --alias local-model \
+  --host 127.0.0.1 --port 8081 --parallel 2
+```
+
+Start the gateway from the repo root in a second terminal.
+
+```sh
+cargo run --locked
+```
+
+Send an interactive request from a third terminal. Add the header `X-Request-Class: batch` to send batch work.
 
 ```sh
 curl --no-buffer http://127.0.0.1:8080/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"local-model","messages":[{"role":"user","content":"Write one sentence about Rust."}],"stream":true,"max_tokens":40}'
+  -d '{"model":"local-model","messages":[{"role":"user","content":"What does an inference gateway do?"}],"stream":true,"max_tokens":40}'
 ```
 
-You should see separate `data:` events as text arrives and a final `data: [DONE]` event. The gateway health endpoint at `/health` returns `204` when the gateway is running.
+You should see `data:` events as text arrives, followed by `data: [DONE]`. The gateway’s `/health` endpoint returns HTTP 204.
 
-Set `MODEL_SERVER_URL` to point to another local HTTP server that exposes `/v1/chat/completions`. For Ollama, run `MODEL_SERVER_URL=http://127.0.0.1:11434 cargo run` and use a model name shown by `ollama list` in the request. Set `GATEWAY_ADDR` to change where the gateway listens.
+| Environment variable | Default | Purpose |
+| --- | --- | --- |
+| `GATEWAY_ADDR` | `127.0.0.1:8080` | Local gateway address. |
+| `MODEL_SERVER_URL` | `http://127.0.0.1:8081` | Origin of the HTTP model server. Use port 11434 for local Ollama. |
+| `MAX_ACTIVE_REQUESTS` | `2` | Maximum active gateway requests. Match the model server’s configured parallel capacity. |
+| `MAX_QUEUED_REQUESTS` | `32` | Maximum waiting requests. Set to zero to skip waiting. |
+| `SCHEDULING_POLICY` | `fifo` | `fifo`, `weighted`, `reserved`, or `adaptive`. |
+| `ADMISSION_PROFILE` and `CHAT_TTFT_MS` | Required for `adaptive` | Calibration JSON path and chat first-token budget in milliseconds. |
 
-## Request limits
+Follow the [evaluation guide](benchmarks/adaptive.md) to generate a profile and reproduce the adaptive comparison. The [original FIFO benchmark](benchmarks/README.md) has the setup for the earlier burst experiments.
 
-The gateway allows two active requests and queues up to 32 more by default. An active request holds its slot until its stream ends or is dropped. The gateway returns HTTP 503 when the queue is full.
-
-Set `MAX_ACTIVE_REQUESTS` to a positive value that fits the backend's parallel capacity. Set `MAX_QUEUED_REQUESTS` to change the waiting limit. A waiting limit of zero rejects requests immediately when every slot is busy.
-
-## Scheduling
-
-`SCHEDULING_POLICY=fifo` serves waiting requests in arrival order and is the default. `SCHEDULING_POLICY=weighted` dispatches three interactive requests for every batch request when both classes have work waiting. Each class keeps its own arrival order, and either class can use spare capacity when the other is empty.
-
-`SCHEDULING_POLICY=reserved` uses the weighted policy and leaves one active slot available only to interactive requests. It requires at least two active slots. The reserved slot remains idle if chat traffic is absent and all other slots are occupied by batch work.
-
-Send `X-Request-Class: batch` for batch work. Requests without the header are interactive. The `X-Queue-Wait-Ms` response header measures time spent waiting for gateway admission.
-
-## Replay a workload
-
-The Python benchmark sends requests on a fixed schedule, even when earlier requests are still running. It expects a local `llama-server` and uses fixed generation lengths with prompt caching disabled. Start the backend with a fixed `--parallel` value (two for these examples), and match it with `MAX_ACTIVE_REQUESTS` on the gateway.
+## Tests
 
 ```sh
-python3 benchmarks/replay.py --label solo --scenario solo --output /tmp/gateway-solo.json
-python3 benchmarks/replay.py --label fifo --scenario burst --deadline-ms 750 --output /tmp/gateway-fifo.json
+cargo test --locked
+python3 -m unittest discover -s benchmarks
 ```
 
-Choose a first-token target from the solo run before comparing policies. Use the same target and scenario for each comparison. Run against the backend directly by setting `--url http://127.0.0.1:8081/v1/chat/completions`.
-
-The JSON report has one row per offered request. The time-to-first-token p95 describes successful streams, and the deadline hit fraction includes failures and rejected requests in the denominator. Batch throughput counts completed requests across the full replay window, including time to drain the queue.
-
-## Adaptive admission
-
-The adaptive policy lets batch work borrow the last idle slot when the calibrated time to first token and the estimated wait for a slot fit the chat budget. A pending chat request, an unprofiled request, or an overdue estimate keeps the slot in reserve. The estimate is scoped to the model and engine used for calibration. The [evaluation guide](benchmarks/adaptive.md) shows how to calibrate it and compare it with native vLLM priority.
+The tests cover queue overflow, cancellation, weighted ordering, fixed and adaptive reservation, and benchmark accounting. They run without model weights.
