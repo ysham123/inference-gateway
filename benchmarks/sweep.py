@@ -1,6 +1,7 @@
 import argparse
 from contextlib import contextmanager
 import json
+import math
 import os
 from pathlib import Path
 import socket
@@ -78,13 +79,18 @@ def main():
     args = parser.parse_args()
     if args.slots < 2 or args.queue < 0 or args.repeats < 1:
         parser.error("need at least two slots, a nonnegative queue, and one or more repeats")
+    numeric = [*args.chat_scales, *args.batch_scales, args.deadline_ms, args.tpot_ms]
+    if any(not math.isfinite(value) or value <= 0 for value in numeric):
+        parser.error("budgets and arrival scales must be positive and finite")
     if not args.profile.is_file() or not args.gateway.is_file():
         parser.error("provide a calibrated profile and a built gateway binary")
 
     policies = ["direct", "weighted", "reserved", "adaptive"]
-    best = {policy: None for policy in policies}
+    frontier = {}
     args.out.mkdir(parents=True, exist_ok=True)
     for chat_scale in args.chat_scales:
+        best = {policy: None for policy in policies}
+        frontier[str(chat_scale)] = best
         for batch_scale in args.batch_scales:
             results = {policy: [] for policy in policies}
             for repeat in range(args.repeats):
@@ -119,7 +125,7 @@ def main():
                             "chat_scale": chat_scale, "batch_scale": batch_scale,
                             "batch_tokens_per_second": rate,
                         }
-    (args.out / "frontier.json").write_text(json.dumps(best, indent=2) + "\n")
+    (args.out / "frontier.json").write_text(json.dumps(frontier, indent=2) + "\n")
 
 
 if __name__ == "__main__":
