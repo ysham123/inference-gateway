@@ -1,3 +1,4 @@
+mod profile;
 mod scheduler;
 
 #[cfg(test)]
@@ -8,6 +9,7 @@ use std::{
     error::Error,
     net::SocketAddr,
     num::NonZeroUsize,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -21,6 +23,7 @@ use axum::{
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
+use profile::Profile;
 use reqwest::{Client, Url, redirect::Policy};
 use scheduler::{RequestClass, Scheduler, SchedulingPolicy};
 use tokio::net::TcpListener;
@@ -30,6 +33,7 @@ struct Gateway {
     client: Client,
     completions_url: Url,
     scheduler: Arc<Scheduler>,
+    profile: Option<Arc<Profile>>,
 }
 
 #[tokio::main]
@@ -44,11 +48,27 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let max_waiting: usize = env::var("MAX_QUEUED_REQUESTS")
         .unwrap_or_else(|_| "32".into())
         .parse()?;
-    let policy: SchedulingPolicy = env::var("SCHEDULING_POLICY")
-        .unwrap_or_else(|_| "fifo".into())
-        .parse()?;
-    if matches!(policy, SchedulingPolicy::Reserved) && max_active.get() < 2 {
-        return Err("SCHEDULING_POLICY=reserved requires MAX_ACTIVE_REQUESTS of at least 2".into());
+    let policy_name = env::var("SCHEDULING_POLICY").unwrap_or_else(|_| "fifo".into());
+    let (policy, profile) = if policy_name == "adaptive" {
+        let path = env::var("ADMISSION_PROFILE")?;
+        let profile = Arc::new(Profile::load(Path::new(&path))?);
+        let deadline_ms: u64 = env::var("CHAT_TTFT_MS")?.parse()?;
+        let slack = Duration::from_millis(deadline_ms)
+            .checked_sub(profile.chat_start)
+            .filter(|slack| !slack.is_zero())
+            .ok_or("CHAT_TTFT_MS must exceed the profiled chat start time")?;
+        (SchedulingPolicy::Adaptive { slack }, Some(profile))
+    } else {
+        (policy_name.parse()?, None)
+    };
+    if matches!(
+        policy,
+        SchedulingPolicy::Reserved | SchedulingPolicy::Adaptive { .. }
+    ) && max_active.get() < 2
+    {
+        return Err(
+            "reserved and adaptive policies require MAX_ACTIVE_REQUESTS of at least 2".into(),
+        );
     }
     let completions_url = Url::parse(&upstream)?.join("/v1/chat/completions")?;
     let client = Client::builder()
@@ -62,6 +82,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         client,
         completions_url,
         scheduler: Arc::new(Scheduler::new(max_active, max_waiting, policy)),
+        profile,
     });
 
     let listener = TcpListener::bind(address).await?;
@@ -90,8 +111,12 @@ async fn chat_completions(
         }
     };
 
+    let estimate = gateway
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.estimate(&body));
     let queued_at = Instant::now();
-    let Ok(admission) = gateway.scheduler.acquire(class).await else {
+    let Ok(admission) = gateway.scheduler.acquire(class, estimate).await else {
         return (StatusCode::SERVICE_UNAVAILABLE, "Model queue is full").into_response();
     };
 

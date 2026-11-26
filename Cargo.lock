@@ -370,6 +370,7 @@ dependencies = [
  "axum",
  "futures-util",
  "reqwest",
+ "serde_json",
  "tokio",
 ]
 

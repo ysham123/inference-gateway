@@ -49,6 +49,7 @@ async fn a_disconnected_stream_releases_the_slot_and_closes_upstream() {
     let gateway_url = serve(router(Gateway {
         client: client.clone(),
         completions_url: backend_url,
+        profile: None,
         scheduler: Arc::new(Scheduler::new(NonZeroUsize::MIN, 0, SchedulingPolicy::Fifo)),
     }))
     .await;
