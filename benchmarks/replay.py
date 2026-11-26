@@ -30,6 +30,8 @@ def workload(scenario):
 
     if scenario == "solo":
         return [chat(index * 0.7, index) for index in range(20)]
+    if scenario == "batch-only":
+        return [batch(index * 0.1, index) for index in range(8)]
     if scenario == "steady":
         requests = [chat(index * 0.6, index) for index in range(24)]
         requests += [batch(index * 2.3, index) for index in range(6)]
@@ -139,7 +141,7 @@ def main():
     parser.add_argument("--url", default="http://127.0.0.1:8080/v1/chat/completions")
     parser.add_argument("--model", default="local-model")
     parser.add_argument("--label", required=True)
-    parser.add_argument("--scenario", choices=("solo", "steady", "burst", "overload"), required=True)
+    parser.add_argument("--scenario", choices=("solo", "steady", "burst", "overload", "batch-only"), required=True)
     parser.add_argument("--deadline-ms", type=float)
     parser.add_argument("--timeout-s", type=float, default=90)
     parser.add_argument("--output", type=Path, required=True)

@@ -2,6 +2,8 @@
 
 A local Rust gateway for streaming chat completions with FIFO, weighted, and reserved-slot scheduling.
 
+In the first local burst replay, weighted scheduling cut successful chat p95 time to first token from 28.2 s to 13.2 s relative to FIFO. Only 2 of 24 chat requests met the 1.4 s target under weighted scheduling. A reserved slot reduced p95 further and completed more chat requests, while reducing batch throughput. See the [benchmark setup and raw results](benchmarks/README.md).
+
 ## Run locally
 
 Start `llama-server` with a local GGUF model in one terminal:
