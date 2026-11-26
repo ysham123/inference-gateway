@@ -40,3 +40,16 @@ Adaptive and fixed reservation recorded 100% and 88% joint chat attainment. Thei
 See the [evaluation guide](../../adaptive.md) for calibration and sweep commands.
 
 Each row is a single run on this CPU backend with synthetic requests. The loads and targets vary between groups. The results describe those test conditions. The CUDA and native vLLM priority comparison is pending.
+
+## Short-batch repeat runs
+
+The chart shows the first run. Two additional pairs used the same workload and budgets, with policy order reversed between the two pairs.
+
+| Run | Adaptive chat hits | Reserved chat hits | Adaptive batch tokens/s | Reserved batch tokens/s |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 24/24 | 21/24 | 7.54 | 7.38 |
+| 2 | 24/24 | 11/24 | 6.42 | 6.79 |
+| 3 | 24/24 | 15/24 | 6.58 | 7.01 |
+
+- Adaptive met the 95% chat target in 3 of three runs, with 6.42–7.54 batch output tokens/s.
+- Reserved met the 95% chat target in 0 of three runs, with 6.79–7.38 batch output tokens/s.
