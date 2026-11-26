@@ -1,18 +1,25 @@
 mod scheduler;
 
-use std::{env, error::Error, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{
+    env,
+    error::Error,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
     body::{Body, Bytes},
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::{StreamExt, stream};
 use reqwest::{Client, Url, redirect::Policy};
-use scheduler::Scheduler;
+use scheduler::{RequestClass, Scheduler, SchedulingPolicy};
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
@@ -34,6 +41,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let max_waiting: usize = env::var("MAX_QUEUED_REQUESTS")
         .unwrap_or_else(|_| "32".into())
         .parse()?;
+    let policy: SchedulingPolicy = env::var("SCHEDULING_POLICY")
+        .unwrap_or_else(|_| "fifo".into())
+        .parse()?;
     let completions_url = Url::parse(&upstream)?.join("/v1/chat/completions")?;
     let client = Client::builder()
         .no_proxy()
@@ -48,7 +58,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_state(Gateway {
             client,
             completions_url,
-            scheduler: Arc::new(Scheduler::new(max_active, max_waiting)),
+            scheduler: Arc::new(Scheduler::new(max_active, max_waiting, policy)),
         });
 
     let listener = TcpListener::bind(address).await?;
@@ -57,11 +67,25 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-async fn chat_completions(State(gateway): State<Gateway>, body: Bytes) -> Response {
-    let Ok(admission) = gateway.scheduler.acquire().await else {
+async fn chat_completions(
+    State(gateway): State<Gateway>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let class = match headers.get("x-request-class").map(HeaderValue::as_bytes) {
+        None | Some(b"interactive") => RequestClass::Interactive,
+        Some(b"batch") => RequestClass::Batch,
+        Some(_) => {
+            return (StatusCode::BAD_REQUEST, "Unknown request class").into_response();
+        }
+    };
+
+    let queued_at = Instant::now();
+    let Ok(admission) = gateway.scheduler.acquire(class).await else {
         return (StatusCode::SERVICE_UNAVAILABLE, "Model queue is full").into_response();
     };
 
+    let queue_wait = queued_at.elapsed();
     let upstream = gateway
         .client
         .post(gateway.completions_url)
@@ -89,6 +113,11 @@ async fn chat_completions(State(gateway): State<Gateway>, body: Bytes) -> Respon
     );
     let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
+    let queue_wait_ms = format!("{:.3}", queue_wait.as_secs_f64() * 1_000.0);
+    response.headers_mut().insert(
+        "x-queue-wait-ms",
+        HeaderValue::from_str(&queue_wait_ms).unwrap(),
+    );
     if let Some(content_type) = content_type {
         response
             .headers_mut()
