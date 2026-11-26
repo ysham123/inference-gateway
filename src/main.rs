@@ -1,4 +1,6 @@
-use std::{env, error::Error, net::SocketAddr, time::Duration};
+mod scheduler;
+
+use std::{env, error::Error, net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -8,13 +10,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use futures_util::{StreamExt, stream};
 use reqwest::{Client, Url, redirect::Policy};
+use scheduler::Scheduler;
 use tokio::net::TcpListener;
 
 #[derive(Clone)]
 struct Gateway {
     client: Client,
     completions_url: Url,
+    scheduler: Arc<Scheduler>,
 }
 
 #[tokio::main]
@@ -23,6 +28,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
         .parse()?;
     let upstream = env::var("MODEL_SERVER_URL").unwrap_or_else(|_| "http://127.0.0.1:8081".into());
+    let max_active: NonZeroUsize = env::var("MAX_ACTIVE_REQUESTS")
+        .unwrap_or_else(|_| "2".into())
+        .parse()?;
+    let max_waiting: usize = env::var("MAX_QUEUED_REQUESTS")
+        .unwrap_or_else(|_| "32".into())
+        .parse()?;
     let completions_url = Url::parse(&upstream)?.join("/v1/chat/completions")?;
     let client = Client::builder()
         .no_proxy()
@@ -37,6 +48,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .with_state(Gateway {
             client,
             completions_url,
+            scheduler: Arc::new(Scheduler::new(max_active, max_waiting)),
         });
 
     let listener = TcpListener::bind(address).await?;
@@ -46,6 +58,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn chat_completions(State(gateway): State<Gateway>, body: Bytes) -> Response {
+    let Ok(admission) = gateway.scheduler.acquire().await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "Model queue is full").into_response();
+    };
+
     let upstream = gateway
         .client
         .post(gateway.completions_url)
@@ -64,8 +80,14 @@ async fn chat_completions(State(gateway): State<Gateway>, body: Bytes) -> Respon
 
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
-    // Axum sends each chunk as reqwest receives it from the model server.
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    let stream = stream::unfold(
+        (Box::pin(upstream.bytes_stream()), admission),
+        |(mut upstream, admission)| async move {
+            let chunk = upstream.next().await?;
+            Some((chunk, (upstream, admission)))
+        },
+    );
+    let mut response = Response::new(Body::from_stream(stream));
     *response.status_mut() = status;
     if let Some(content_type) = content_type {
         response
