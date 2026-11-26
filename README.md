@@ -1,5 +1,7 @@
 # Inference Gateway
 
+[![Checks](https://github.com/ysham123/inference-gateway/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/ysham123/inference-gateway/actions/workflows/checks.yml)
+
 A Rust gateway for serving interactive chat and batch jobs on the same local LLM. It streams OpenAI-style chat completions, limits the waiting queue, and uses measured request times to decide when batch work can use the last idle model slot.
 
 [Quick start](#quick-start) · [How it works](#how-it-works) · [Evaluation guide](benchmarks/adaptive.md) · [Raw results and chart](benchmarks/results/adaptive-m2-pro/)
