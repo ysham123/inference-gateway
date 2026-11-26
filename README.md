@@ -40,11 +40,11 @@ A request holds its slot while the model streams. If the client disconnects, the
 
 ## Quick start
 
-You’ll need Rust and Cargo, `llama-server`, and a local GGUF model. Start the model server in one terminal.
+You’ll need Rust and Cargo, `llama-server`, and a local GGUF model. Start the model server with two CPU slots in one terminal.
 
 ```sh
 llama-server --model /path/to/model.gguf --alias local-model \
-  --host 127.0.0.1 --port 8081 --parallel 2
+  --host 127.0.0.1 --port 8081 --device none --n-gpu-layers 0 --ctx-size 1536 --parallel 2 --threads 4
 ```
 
 Start the gateway from the repo root in a second terminal.
