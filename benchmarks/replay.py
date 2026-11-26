@@ -217,6 +217,7 @@ def main():
     parser.add_argument("--batch-scale", type=float, default=1)
     parser.add_argument("--backend", choices=("llama", "vllm"), default="llama")
     parser.add_argument("--native-priority", action="store_true")
+    parser.add_argument("--batch-max-tokens", type=int)
     parser.add_argument("--trace", type=Path)
     parser.add_argument("--trace-limit", type=int, default=24)
     parser.add_argument("--trace-offset", type=int, default=0)
@@ -226,6 +227,8 @@ def main():
     parser.add_argument("--allow-all-rejected", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
+    if args.batch_max_tokens is not None and args.batch_max_tokens < 1:
+        parser.error("--batch-max-tokens must be positive")
     endpoint = urlsplit(args.url)
     if endpoint.scheme != "http" or not endpoint.hostname or not endpoint.path:
         parser.error("--url must be an HTTP URL with a hostname and completions path")
@@ -250,6 +253,13 @@ def main():
         trace_workload(args.trace, args.trace_limit, args.trace_offset)
         if args.trace else workload(args.scenario, args.profile_words, args.profile_caps)
     )
+    if args.batch_max_tokens is not None:
+        if args.scenario == "calibration":
+            parser.error("use --profile-caps to set calibration output limits")
+        base = [
+            replace(request, max_tokens=args.batch_max_tokens) if request.request_class == "batch" else request
+            for request in base
+        ]
     scales = {"interactive": args.chat_scale, "batch": args.batch_scale}
     requests = sorted(
         (replace(request, arrival_s=request.arrival_s * scales[request.request_class]) for request in base),
@@ -275,6 +285,7 @@ def main():
         "tpot_ms": args.tpot_ms,
         "chat_scale": args.chat_scale,
         "batch_scale": args.batch_scale,
+        "batch_max_tokens": args.batch_max_tokens,
         "backend": args.backend,
         "native_priority": args.native_priority,
         "trace": args.trace.name if args.trace else None,

@@ -18,12 +18,12 @@ def main():
     reports = [json.loads(path.read_text()) for path in args.reports]
     cases = {
         (report["scenario"], report["deadline_ms"], report["model"], report.get("tpot_ms"),
-         report.get("chat_scale", 1), report.get("batch_scale", 1))
+         report.get("chat_scale", 1), report.get("batch_scale", 1), report.get("batch_max_tokens"))
         for report in reports
     }
     if len(cases) != 1 or reports[0]["deadline_ms"] is None:
         parser.error("all reports must use the same model, scenario, and first-token target")
-    scenario, target, _, tpot, _, _ = cases.pop()
+    scenario, target, _, tpot, _, _, _ = cases.pop()
     if args.joint != (tpot is not None):
         parser.error("--joint is required for reports with both deadlines and omitted for first-token-only reports")
 

@@ -74,9 +74,12 @@ def main():
     parser.add_argument("--chat-scales", type=float, nargs="+", default=[0.5, 1, 2])
     parser.add_argument("--batch-scales", type=float, nargs="+", default=[0.5, 1, 2])
     parser.add_argument("--scenario", choices=("steady", "burst", "overload"), default="steady")
+    parser.add_argument("--batch-max-tokens", type=int)
     parser.add_argument("--trace", type=Path)
     parser.add_argument("--trace-offset", type=int, default=0)
     args = parser.parse_args()
+    if args.batch_max_tokens is not None and args.batch_max_tokens < 1:
+        parser.error("--batch-max-tokens must be positive")
     if args.slots < 2 or args.queue < 0 or args.repeats < 1:
         parser.error("need at least two slots, a nonnegative queue, and one or more repeats")
     numeric = [*args.chat_scales, *args.batch_scales, args.deadline_ms, args.tpot_ms]
@@ -108,6 +111,8 @@ def main():
                         ]
                         if args.backend == "vllm":
                             command.append("--native-priority")
+                        if args.batch_max_tokens is not None:
+                            command += ["--batch-max-tokens", str(args.batch_max_tokens)]
                         if args.trace:
                             command += ["--trace", str(args.trace), "--trace-offset", str(args.trace_offset)]
                         subprocess.run(command, check=True)
